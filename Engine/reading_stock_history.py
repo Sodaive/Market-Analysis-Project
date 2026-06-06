@@ -2,8 +2,9 @@ import requests
 import json
 import pandas as pd
 
+symbol = str(input('Please enter the symbol name in persian: '))
 
-url = "https://Api.BrsApi.ir/Tsetmc/AllSymbols.php?key=BcVu5MdZbfyfRyZ4hxhXvCj4BDEUUj7B&type=1"
+url = f"https://Api.BrsApi.ir/Tsetmc/History.php?key=BcVu5MdZbfyfRyZ4hxhXvCj4BDEUUj7B&type=0&l18={symbol}"
 
     # تنظیم یوزر ایجنت برای جلوگیری از بلاک شدن به دلیل اینکه یوزر ایجنت پایتون در استاندارد فایروال 6جی مسدود می‌شود
 
@@ -23,23 +24,24 @@ if response.status_code == 200:
 
 # Save as CSV
 
-#    df = pd.DataFrame(data)
-#    df.to_csv(
-#         "symbols.csv",
-#         index=False,
-#         encoding="utf-8-sig"
-#     )
-#    print(df.head())
+   df = pd.DataFrame(data)
+   df.to_csv(
+        "DataFrames/h_stock.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+   print('Data saved to h_stock.csv')
 
-   with open("stock.json", "w", encoding="utf-8") as f:
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=4
-        )
+# Save as json
 
-   print("Data saved to stock.json")
+#    with open("Json/h_stock.json", "w", encoding="utf-8") as f:
+#         json.dump(
+#             data,
+#             f,
+#             ensure_ascii=False,
+#             indent=4
+#         )
+#    print("Data saved to h_stock.json")
 
 else:
    print(f"Error: {response.status_code}")
