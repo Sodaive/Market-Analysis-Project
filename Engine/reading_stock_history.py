@@ -4,6 +4,9 @@ import pandas as pd
 
 symbol = str(input('Please enter the symbol name in persian: '))
 
+with open("symbol.txt", "w", encoding="utf-8") as f:
+    f.write(symbol)
+
 url = f"https://Api.BrsApi.ir/Tsetmc/History.php?key=BcVu5MdZbfyfRyZ4hxhXvCj4BDEUUj7B&type=0&l18={symbol}"
 
     # تنظیم یوزر ایجنت برای جلوگیری از بلاک شدن به دلیل اینکه یوزر ایجنت پایتون در استاندارد فایروال 6جی مسدود می‌شود
@@ -30,7 +33,7 @@ if response.status_code == 200:
         index=False,
         encoding="utf-8-sig"
     )
-   print('Data saved to h_stock.csv')
+   print('Data saved to DataFrames/h_stock.csv')
 
 # Save as json
 
