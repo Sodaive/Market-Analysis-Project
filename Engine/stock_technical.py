@@ -169,7 +169,7 @@ def calculate_score(df):
 
     return {
         "symbol": symbol,
-        "score": round(score, 2),
+        "score": str(round(score, 2)) + '/100',
         "price": latest["pc"],
         "rsi": round(latest["rsi"], 2),
         "macd": round(latest["macd"], 2),
