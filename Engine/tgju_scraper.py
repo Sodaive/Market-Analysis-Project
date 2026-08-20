@@ -136,12 +136,15 @@ def fetch_all_currencies() -> dict:
 
 
 def fetch_tgju_history(grade: str) -> pd.DataFrame:
-    """تاریخچه عمومی از tgju — برای سازگاری با import قدیمی."""
+    """تاریخچه عمومی از tgju — cache روزانه + API."""
     cache = DIR_HISTORY / f"tgju_{grade}.csv"
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
     if cache.exists():
-        df = pd.read_csv(cache, encoding="utf-8-sig")
-        if not df.empty:
-            return df
+        cache_date = pd.Timestamp(cache.stat().st_mtime, unit="s").strftime("%Y-%m-%d")
+        if cache_date == today:
+            df = pd.read_csv(cache, encoding="utf-8-sig")
+            if not df.empty:
+                return df
 
     df = _fetch_history_via_api(grade)
     if not df.empty:

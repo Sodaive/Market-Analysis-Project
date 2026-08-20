@@ -16,7 +16,6 @@ from ta.trend import MACD, EMAIndicator
 # ─── تنظیمات ───────────────────────────────────────────────────────────────────
 load_dotenv()
 from Engine.rahavard_scraper import fetch_all_symbols as _scrape_all_symbols
-from Engine.tgju_scraper import fetch_tgju_history
 from Engine.rahavard_scraper import fetch_history as _scrape_history
 
 DELAY_SEC   = 0.1                # فاصله بین هر درخواست (ثانیه) — برای جلوگیری از rate-limit
@@ -24,6 +23,7 @@ DELAY_SEC   = 0.1                # فاصله بین هر درخواست (ثان
 # پوشه‌های خروجی
 DIR_HISTORY = Path("/home/suda/Projects/MAP/DataFrames/history")   # CSV تاریخی هر نماد
 DIR_OUT     = Path("/home/suda/Projects/MAP/DataFrames/output")    # خروجی نهایی
+MIN_DATA_DAYS = 20  # حداقل تعداد روزهای داده برای تحلیل معتبر
 
 DIR_HISTORY.mkdir(parents=True, exist_ok=True)
 DIR_OUT.mkdir(parents=True, exist_ok=True)
@@ -110,13 +110,13 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"ستون‌های مفقود: {missing}")
 
+    df = df.copy()
+
     # ستون‌های اختیاری — اگه نبود مقدار پیش‌فرض بذار
     if "tval" not in df.columns:
         df["tval"] = df["tvol"] * df["pc"]
     if "tno" not in df.columns:
         df["tno"] = 0
-
-    df = df.copy()
 
     # تبدیل تاریخ شمسی به عدد قابل مرتب‌سازی (رشته کافیه چون فرمت YYYY-MM-DD هست)
     df["date"] = df["date"].astype(str)
@@ -285,7 +285,10 @@ def score_row(row) -> tuple[float, dict]:
         "rel_value":  _s_ratio(row.get("rel_value",  np.nan), W.rel_value),
         "rel_trades": _s_ratio(row.get("rel_trades", np.nan), W.rel_trades),
     }
-    return sum(parts.values()), parts
+    raw = sum(parts.values())
+    _avail = [w for w, v in [(W.rsi,row.get("rsi")),(W.macd,row.get("macd_diff")),(W.ema20,row.get("ema_pct")),(W.bollinger,row.get("bb_pct")),(W.stochastic,row.get("stoch_rsi_k")),(W.obv*0.8,row.get("obv_signal")),(W.adx,row.get("adx")),(W.sma*1.2,row.get("sma_signal")),(W.rel_volume,row.get("rel_volume")),(W.rel_value,row.get("rel_value")),(W.rel_trades,row.get("rel_trades"))] if not pd.isna(v)]
+    max_p = sum(_avail) if _avail else 1
+    return round(raw * 100 / max_p, 2), parts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -295,8 +298,8 @@ def score_row(row) -> tuple[float, dict]:
 def analyze(symbol: str, raw: pd.DataFrame, asset_type: str = "سهم") -> Result:
     try:
         df  = prepare(raw)
-        if len(df) < 20:
-            return Result(symbol=symbol, asset_type=asset_type, error="داده کافی نیست")
+        if len(df) < MIN_DATA_DAYS:
+            return None  # نمادهای با داده کم نادیده گرفته میشن
         df  = add_indicators(df)
         # Multi-day smoothing: average last 5 days of indicators to reduce rank instability
         # ponytail: 5-day window, increase to 7-10 for even more stability
@@ -309,9 +312,9 @@ def analyze(symbol: str, raw: pd.DataFrame, asset_type: str = "سهم") -> Resul
         rsi_val = row.get("rsi", np.nan)
 
         ema_val = row.get("ema_pct", 0)
-        if total >= 65 and (pd.isna(rsi_val) or rsi_val < 70) and (pd.isna(ema_val) or ema_val > -5):
+        if total >= 50 and (pd.isna(rsi_val) or rsi_val < 70) and (pd.isna(ema_val) or ema_val > -5):
             signal = "BUY"
-        elif total <= 35:
+        elif total <= 27:
             signal = "SELL"
         else:
             signal = "NEUTRAL"
@@ -377,7 +380,8 @@ def scan_market(
             raw = fetch_history(sym)
         if raw is None or raw.empty:
             return Result(symbol=sym, error="داده‌ای دریافت نشد")
-        return analyze(sym, raw, asset_type="سهم")
+        result = analyze(sym, raw, asset_type="سهم")
+        return result  # None if insufficient data
 
     def _scan_gold():
         try:
@@ -394,7 +398,9 @@ def scan_market(
         try:
             from Engine.tgju_scraper import fetch_all_currencies
             for name, cur in fetch_all_currencies().items():
-                results.append(analyze(name, cur, asset_type=name))
+                res = analyze(name, cur, asset_type=name)
+                if res is not None:
+                    results.append(res)
             log.info("ارزها اضافه شد")
         except Exception as e:
             log.warning("خطا در دریافت ارزها: %s", e)

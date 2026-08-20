@@ -80,7 +80,7 @@ def fetch_history(symbol: str) -> Optional[pd.DataFrame]:
             return None
 
     asset_id = _SYMBOL_MAP[symbol]["asset_id"]
-    ticker = f"exchange.asset:{asset_id}"
+    ticker = f"exchange.asset:{asset_id}:D"
 
     try:
         r = requests.get(
