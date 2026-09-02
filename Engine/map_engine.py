@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,10 +17,11 @@ from ta.trend import MACD, EMAIndicator
 
 # ─── تنظیمات ───────────────────────────────────────────────────────────────────
 load_dotenv()
-from Engine.rahavard_scraper import fetch_all_symbols as _scrape_all_symbols
-from Engine.rahavard_scraper import fetch_history as _scrape_history
-
-DELAY_SEC   = 0.1                # فاصله بین هر درخواست (ثانیه) — برای جلوگیری از rate-limit
+# طبق تصمیم پروژه: rahavard365/shakhesban کلاً حذف شد. منبع سهام الان مستقیماً
+# tsetmc.com (سایت رسمی بورس تهران، بدون نیاز به API key) هست.
+from Engine.tsetmc_scraper import fetch_all_symbols as _scrape_all_symbols
+from Engine.tsetmc_scraper import fetch_history as _scrape_history
+from Engine.tgju_scraper import CURRENCY_ROWS
 
 # پوشه‌های خروجی
 DIR_HISTORY = Path("/home/suda/Projects/MAP/DataFrames/history")   # CSV تاریخی هر نماد
@@ -57,6 +60,15 @@ class Weights:
 
 W = Weights()
 
+# امتیاز خنثی که به یه اندیکاتور "غیرقابل‌محاسبه" (مثلاً OBV و حجم نسبی برای طلا/دلار
+# که حجم معاملاتی ندارن، یا SMA200 برای نمادهای با تاریخچه کوتاه) داده میشه.
+# چرا مهمه: قبلاً این اندیکاتورهای گمشده کاملاً از مخرج امتیازدهی حذف می‌شدن، یعنی
+# دارایی‌هایی مثل طلا/دلار با مخرج کوچیک‌تر امتیازشون به‌طور سیستماتیک تا ~20%
+# نسبت به سهام تورم پیدا می‌کرد (رتبه‌بندی ناعادلانه). حالا مخرج برای همه دارایی‌ها
+# ثابته و اندیکاتور گمشده نه امتیاز کامل می‌گیره نه صفر می‌شه — نصف وزنش رو می‌گیره
+# که یعنی "نه به نفع نه به ضرر".
+NEUTRAL_FRACTION = 0.5
+
 # ─── مدل نتیجه ─────────────────────────────────────────────────────────────────
 @dataclass
 class Result:
@@ -85,12 +97,12 @@ class Result:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_all_symbols() -> list[str]:
-    """لیست نام فارسی همه نمادهای بورس را برمی‌گرداند — از rahavard365.com."""
+    """لیست نمادهای بورس و فرابورس را برمی‌گرداند — مستقیم از tsetmc.com."""
     return _scrape_all_symbols()
 
 
 def fetch_history(symbol: str) -> Optional[pd.DataFrame]:
-    """داده تاریخی یک نماد را دریافت و به DataFrame تبدیل می‌کند — از rahavard365.com."""
+    """داده تاریخی یک نماد را دریافت و به DataFrame تبدیل می‌کند — مستقیم از tsetmc.com."""
     df = _scrape_history(symbol)
     if df is not None and not df.empty:
         cache = DIR_HISTORY / f"{symbol}.csv"
@@ -135,11 +147,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     from ta.momentum import StochRSIIndicator
     from ta.volume import OnBalanceVolumeIndicator
     from ta.trend import ADXIndicator, SMAIndicator
-    
+
     close = df["pc"]
     high = df.get("pmax", close)
     low = df.get("pmin", close)
-    
+
     # ─── اندیکاتورهای پایه ─────────────────────────────────────────
     df["rsi"]        = RSIIndicator(close=close, window=14).rsi()
     _m               = MACD(close=close)
@@ -148,7 +160,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd_diff"]  = df["macd"] - df["macd_sig"]
     df["ema20"]      = EMAIndicator(close=close, window=20).ema_indicator()
     df["ema_pct"]    = (close - df["ema20"]) / df["ema20"] * 100
-    
+
     # ─── بولینگر باند ───────────────────────────────────────────────
     try:
         bb = BollingerBands(close=close, window=20, window_dev=2)
@@ -158,54 +170,69 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"] * 100
         df["bb_pct"]   = (close - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"]) * 100
     except Exception:
-        df["bb_pct"] = 50.0
-    
+        df["bb_pct"] = np.nan  # نامعلوم — به‌جای مقدار خنثی هاردکد، بذار امتیازدهی خودش خنثی‌سازی کنه
+
     # ─── استوکاستیک ────────────────────────────────────────────────
     try:
         stoch = StochRSIIndicator(close=close, window=14, smooth1=3, smooth2=3)
         df["stoch_rsi_k"] = stoch.stochrsi_k() * 100
         df["stoch_rsi_d"] = stoch.stochrsi_d() * 100
     except Exception:
-        df["stoch_rsi_k"] = 50.0
-        df["stoch_rsi_d"] = 50.0
-    
+        df["stoch_rsi_k"] = np.nan
+        df["stoch_rsi_d"] = np.nan
+
     # ─── OBV ───────────────────────────────────────────────────────
     try:
-        df["obv"] = OnBalanceVolumeIndicator(close=close, volume=df["tvol"]).on_balance_volume()
-        df["obv_sma"] = df["obv"].rolling(20, min_periods=1).mean()
-        df["obv_signal"] = np.where(df["obv"] > df["obv_sma"], 1, -1)
+        if df["tvol"].fillna(0).sum() > 0:
+            df["obv"] = OnBalanceVolumeIndicator(close=close, volume=df["tvol"]).on_balance_volume()
+            df["obv_sma"] = df["obv"].rolling(20, min_periods=1).mean()
+            df["obv_signal"] = np.where(df["obv"] > df["obv_sma"], 1, -1)
+        else:
+            df["obv_signal"] = np.nan  # حجم نداریم (طلا/ارز tgju) — از امتیازدهی خارج (امتیاز خنثی می‌گیره)
     except Exception:
-        df["obv_signal"] = 0
-    
+        df["obv_signal"] = np.nan
+
     # ─── ADX ───────────────────────────────────────────────────────
     try:
         adx = ADXIndicator(high=high, low=low, close=close, window=14)
         df["adx"] = adx.adx()
     except Exception:
-        df["adx"] = 25.0
-    
+        df["adx"] = np.nan
+
     # ─── SMA Crossover ─────────────────────────────────────────────
     try:
         df["sma50"] = SMAIndicator(close=close, window=50).sma_indicator()
         df["sma200"] = SMAIndicator(close=close, window=200).sma_indicator()
-        df["sma_signal"] = np.where(
-            (df["sma50"] > df["sma200"]) & (df["sma50"].shift(1) <= df["sma200"].shift(1)), 2,
-            np.where(df["sma50"] > df["sma200"], 1,
-            np.where(df["sma50"] < df["sma200"], -1, 0))
-        )
+        # نکته‌ی مهم (تأیید شده تجربی روی داده‌ی واقعی): کتابخونه‌ی ta برخلاف تصور
+        # اولیه، با کمتر از window ردیف داده NaN برنمی‌گردونه — میانگینِ همون تعداد
+        # کمِ موجود رو حساب می‌کنه (یه مقدار بی‌معنی، نه یه مقدار گمشده). یعنی برای
+        # نمادی با ۳۰ روز تاریخچه، sma50 و sma200 هر دو تقریباً میانگین همون ۳۰ روزن
+        # و تقریباً مساوی میشن → می‌افته روی شاخه‌ی پیش‌فرض 0، که غلط‌انداز به‌نظر
+        # می‌رسه (انگار سیگنال واقعی محاسبه شده). پس چک NaN بودن کافی نیست؛ باید طول
+        # واقعی داده رو صریحاً چک کنیم.
+        if len(df) >= 200:
+            df["sma_signal"] = np.where(
+                (df["sma50"] > df["sma200"]) & (df["sma50"].shift(1) <= df["sma200"].shift(1)), 2,
+                np.where(df["sma50"] > df["sma200"], 1,
+                np.where(df["sma50"] < df["sma200"], -1, 0))
+            )
+            df.loc[df["sma200"].isna(), "sma_signal"] = np.nan
+        else:
+            # کمتر از ۲۰۰ روز داده — SMA200 معنی‌دار نیست، صراحتاً خنثی حسابش کن
+            df["sma_signal"] = np.nan
     except Exception:
-        df["sma_signal"] = 0
-    
+        df["sma_signal"] = np.nan
+
     # ─── حجم نسبی ──────────────────────────────────────────────────
     roll = df.rolling(30, min_periods=1)
     df["avg_vol30"]  = roll["tvol"].mean()
     df["avg_val30"]  = roll["tval"].mean()
     df["avg_tno30"]  = roll["tno"].mean()
-    
+
     df["rel_volume"] = df["tvol"] / df["avg_vol30"].replace(0, np.nan)
     df["rel_value"]  = df["tval"] / df["avg_val30"].replace(0, np.nan)
     df["rel_trades"] = df["tno"]  / df["avg_tno30"].replace(0, np.nan)
-    
+
     return df
 
 
@@ -221,9 +248,16 @@ def _s_rsi(v):
     return 0.0
 
 def _s_macd(v):
+    """MACD: نگاشت پیوسته و حساس به بزرگی سیگنال (نه فقط علامتش).
+    قبلاً این تابع در هر دو شاخه (مثبت/منفی) عملاً باینری بود: هر مقدار مثبت،
+    فارغ از بزرگی‌اش، امتیاز کامل می‌گرفت و هر مقدار منفی دقیقاً نصف امتیاز
+    (چون v/|v| همیشه ±1 میشه) — یعنی بزرگی واقعی MACD اصلاً تأثیری نداشت.
+    با tanh یه منحنی پیوسته می‌سازیم: نزدیک صفر ≈ نصف امتیاز، هرچه سیگنال
+    قوی‌تر (مثبت یا منفی) باشه امتیاز به سمت کامل یا صفر میل می‌کنه.
+    """
     if pd.isna(v): return 0.0
-    if v > 0:      return float(W.macd)
-    return max(0.0, W.macd * (1 + v / (abs(v) + 1e-9) * 0.5))
+    scaled = np.tanh(v / 2.0)  # بازه (-1, 1)
+    return float(W.macd) * (scaled + 1) / 2
 
 def _s_ema(v):
     if pd.isna(v): return 0.0
@@ -271,24 +305,60 @@ def _s_adx(v):
     if v >= 25:    return float(W.adx)
     return W.adx * v / 25
 
+
+# نگاشت واحد و کانونی: هر اندیکاتور دقیقاً یه‌بار این‌جا تعریف میشه (اسم، حداکثر
+# امتیاز واقعی‌اش، و تابع امتیازدهی‌اش). قبلاً این نگاشت به‌صورت دستی و جداگانه هم
+# توی score_row و هم توی محاسبه‌ی max_p تکرار شده بود؛ اگه یکی آپدیت می‌شد و اون
+# یکی نه، امتیازدهی بی‌سروصدا و به‌شکل ظریف خراب می‌شد (دقیقاً مثل باگ قبلی
+# دیورجنس وزن‌های هاردکد از Weights). حالا فقط یه منبع حقیقت داریم.
+_SCORE_SPECS = [
+    ("rsi",        float(W.rsi),          lambda row: _s_rsi(row.get("rsi"))),
+    ("macd",       float(W.macd),         lambda row: _s_macd(row.get("macd_diff"))),
+    ("ema20",      float(W.ema20),        lambda row: _s_ema(row.get("ema_pct"))),
+    ("bollinger",  float(W.bollinger),    lambda row: _s_bollinger(row.get("bb_pct"))),
+    ("stochastic", float(W.stochastic),   lambda row: _s_stochastic(row.get("stoch_rsi_k"), row.get("stoch_rsi_d"))),
+    ("obv",        float(W.obv) * 0.8,    lambda row: _s_obv(row.get("obv_signal"))),
+    ("adx",        float(W.adx),          lambda row: _s_adx(row.get("adx"))),
+    ("sma",        float(W.sma) * 1.2,    lambda row: _s_sma(row.get("sma_signal"))),
+    ("rel_volume", float(W.rel_volume),   lambda row: _s_ratio(row.get("rel_volume"), W.rel_volume)),
+    ("rel_value",  float(W.rel_value),    lambda row: _s_ratio(row.get("rel_value"),  W.rel_value)),
+    ("rel_trades", float(W.rel_trades),   lambda row: _s_ratio(row.get("rel_trades"), W.rel_trades)),
+]
+
+_TOTAL_MAX_SCORE = sum(max_score for _, max_score, _ in _SCORE_SPECS)
+
+
+def _indicator_is_missing(name: str, row) -> bool:
+    """آیا داده‌ی خام این اندیکاتور موجوده یا نه (برای تشخیص امتیاز خنثی)."""
+    if name == "stochastic":
+        return pd.isna(row.get("stoch_rsi_k")) or pd.isna(row.get("stoch_rsi_d"))
+    raw_key = {
+        "rsi": "rsi", "macd": "macd_diff", "ema20": "ema_pct", "bollinger": "bb_pct",
+        "obv": "obv_signal", "adx": "adx", "sma": "sma_signal",
+        "rel_volume": "rel_volume", "rel_value": "rel_value", "rel_trades": "rel_trades",
+    }[name]
+    return pd.isna(row.get(raw_key))
+
+
 def score_row(row) -> tuple[float, dict]:
-    parts = {
-        "rsi":        _s_rsi(row.get("rsi", np.nan)),
-        "macd":       _s_macd(row.get("macd_diff", np.nan)),
-        "ema20":      _s_ema(row.get("ema_pct", np.nan)),
-        "bollinger":  _s_bollinger(row.get("bb_pct", np.nan)),
-        "stochastic": _s_stochastic(row.get("stoch_rsi_k", np.nan), row.get("stoch_rsi_d", np.nan)),
-        "obv":        _s_obv(row.get("obv_signal", np.nan)),
-        "adx":        _s_adx(row.get("adx", np.nan)),
-        "sma":        _s_sma(row.get("sma_signal", np.nan)),
-        "rel_volume": _s_ratio(row.get("rel_volume", np.nan), W.rel_volume),
-        "rel_value":  _s_ratio(row.get("rel_value",  np.nan), W.rel_value),
-        "rel_trades": _s_ratio(row.get("rel_trades", np.nan), W.rel_trades),
-    }
-    raw = sum(parts.values())
-    _avail = [w for w, v in [(W.rsi,row.get("rsi")),(W.macd,row.get("macd_diff")),(W.ema20,row.get("ema_pct")),(W.bollinger,row.get("bb_pct")),(W.stochastic,row.get("stoch_rsi_k")),(W.obv*0.8,row.get("obv_signal")),(W.adx,row.get("adx")),(W.sma*1.2,row.get("sma_signal")),(W.rel_volume,row.get("rel_volume")),(W.rel_value,row.get("rel_value")),(W.rel_trades,row.get("rel_trades"))] if not pd.isna(v)]
-    max_p = sum(_avail) if _avail else 1
-    return round(raw * 100 / max_p, 2), parts
+    """
+    امتیاز نهایی رو از روی مخرج ثابت (_TOTAL_MAX_SCORE) حساب می‌کنیم، نه از روی
+    مجموع وزن‌های موجود. این‌طوری دارایی‌هایی مثل طلا/دلار که حجم معاملاتی ندارن
+    (و در نتیجه OBV/حجم‌نسبی/ارزش‌نسبی/معاملات‌نسبی‌شون NaN میشه) دیگه به‌طور
+    مصنوعی امتیازشون تورم پیدا نمی‌کنه؛ اندیکاتور گمشده به‌جای حذف کامل از
+    مخرج، امتیاز خنثی (نصف وزن) می‌گیره — نه به نفعش نه به ضررش.
+    """
+    parts = {}
+    raw = 0.0
+    for name, max_score, fn in _SCORE_SPECS:
+        if _indicator_is_missing(name, row):
+            parts[name] = max_score * NEUTRAL_FRACTION
+        else:
+            parts[name] = fn(row)
+        raw += parts[name]
+
+    total = raw * 100 / _TOTAL_MAX_SCORE
+    return round(total, 2), {k: round(v, 2) for k, v in parts.items()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -302,7 +372,6 @@ def analyze(symbol: str, raw: pd.DataFrame, asset_type: str = "سهم") -> Resul
             return None  # نمادهای با داده کم نادیده گرفته میشن
         df  = add_indicators(df)
         # Multi-day smoothing: average last 5 days of indicators to reduce rank instability
-        # ponytail: 5-day window, increase to 7-10 for even more stability
         window = min(5, len(df))
         indicator_cols = ['rsi','macd_diff','ema_pct','bb_pct','stoch_rsi_k','stoch_rsi_d',
                           'adx','obv_signal','sma_signal','rel_volume','rel_value','rel_trades']
@@ -349,11 +418,34 @@ def analyze(symbol: str, raw: pd.DataFrame, asset_type: str = "سهم") -> Resul
 # ٥. اسکن کامل بازار
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _scan_gold():
+    try:
+        from Engine.tgju_scraper import fetch_gold_history
+        gold = fetch_gold_history()
+        if gold is not None and not gold.empty:
+            return analyze("طلای 18 عیار", gold, asset_type="طلا")
+    except Exception as e:
+        log.warning("خطا در دریافت طلا: %s", e)
+    return None
+
+
+def _scan_currency(name: str):
+    try:
+        from Engine.tgju_scraper import fetch_currency_history
+        cur = fetch_currency_history(name)
+        if cur is not None and not cur.empty:
+            return analyze(name, cur, asset_type=name)
+    except Exception as e:
+        log.warning("خطا در دریافت ارز %s: %s", name, e)
+    return None
+
+
 def scan_market(
     symbols: list[str],
-    max_symbols: int = 0,         # 0 = همه
+    max_symbols: int = 0,          # 0 = همه
     use_cache: bool  = True,
-    include_assets: bool = True,   # طلا/ارز هم اسکن بشه؟
+    include_gold: bool = True,
+    include_currency: bool = True,
 ) -> pd.DataFrame:
     """
     اسکن کامل بازار (سهام + طلا + ارز).
@@ -362,13 +454,14 @@ def scan_market(
         symbols = symbols[:max_symbols]
 
     total = len(symbols)
-    if total == 0:
+    # قبلاً اگه symbols خالی بود (مثلاً موقع اسکن فقط-طلا یا فقط-ارز با --assets)
+    # کل تابع همون‌جا با یه دیتافریم خالی برمی‌گشت و اصلاً طلا/ارز اسکن نمی‌شدن.
+    if total == 0 and not include_gold and not include_currency:
         log.error("هیچ نمادی برای اسکن وجود ندارد!")
         return pd.DataFrame(columns=["رتبه","نماد","نوع","امتیاز","سیگنال","RSI","MACD_diff","EMA_pct","BB_pct","Stoch_RSI","OBV","ADX","SMA","حجم_نسبی","ارزش_نسبی","معاملات_نسبی","تعداد_روز","خطا"])
 
-    log.info("شروع اسکن %d نماد...", total)
-
-    results: list[Result] = []
+    log.info("شروع اسکن %d نماد سهام + %s طلا + %s ارز...",
+              total, "بله" if include_gold else "خیر", "بله" if include_currency else "خیر")
 
     def _scan_one(sym):
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
@@ -379,59 +472,82 @@ def scan_market(
         else:
             raw = fetch_history(sym)
         if raw is None or raw.empty:
-            return Result(symbol=sym, error="داده‌ای دریافت نشد")
+            return None   # بعدا در دور بازیابی دوباره امتحان می‌شود
         result = analyze(sym, raw, asset_type="سهم")
         return result  # None if insufficient data
 
-    def _scan_gold():
-        try:
-            from Engine.tgju_scraper import fetch_gold_history
-            gold = fetch_gold_history()
-            if gold is not None:
-                return analyze("طلای 18 عیار", gold, asset_type="طلا")
-        except Exception as e:
-            log.warning("خطا در دریافت طلا: %s", e)
-        return None
-
-    def _scan_currencies():
-        results = []
-        try:
-            from Engine.tgju_scraper import fetch_all_currencies
-            for name, cur in fetch_all_currencies().items():
-                res = analyze(name, cur, asset_type=name)
-                if res is not None:
-                    results.append(res)
-            log.info("ارزها اضافه شد")
-        except Exception as e:
-            log.warning("خطا در دریافت ارزها: %s", e)
-        return results
-
     # ─── Parallel: سهام + طلا + ارزها ─────────────────────────────────
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_scan_one, sym): sym for sym in symbols}
-        
-        # Add gold and currencies to pool
-        if include_assets:
-            gold_future = pool.submit(_scan_gold)
-            currency_future = pool.submit(_scan_currencies)
-            futures[gold_future] = "GOLD"
-            futures[currency_future] = "CURRENCIES"
-        
+    def _run_pool(job_map: dict, label: str) -> dict:
+        """اجرای موازی با ۱۲ worker. اگه tsetmc زیاد 403/rate-limit داد، این عدد رو کم کن."""
+        out: dict = {}
         done_count = 0
-        for future in as_completed(futures):
-            done_count += 1
-            sym = futures[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    if isinstance(result, list):
-                        results.extend(result)
-                    else:
-                        results.append(result)
-            except Exception as e:
-                results.append(Result(symbol=sym, error=str(e)))
-            if done_count % 50 == 0 or done_count == total + (2 if include_assets else 0):
-                log.info("[%d/%d] تکمیل شد", done_count, total + (2 if include_assets else 0))
+        total_jobs = len(job_map)
+        t_pool = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            futures = {pool.submit(fn): name for name, fn in job_map.items()}
+            for future in as_completed(futures):
+                done_count += 1
+                name = futures[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        out[name] = result
+                except Exception:
+                    pass
+                if done_count % 25 == 0 or done_count == total_jobs:
+                    rate = len(out) / done_count * 100
+                    elapsed = time.perf_counter() - t_pool
+                    log.info("[%s %d/%d — %d ok (%.0f%%) %ds]",
+                             label, done_count, total_jobs, len(out), rate, elapsed)
+        return out
+
+    jobs: dict = {sym: (lambda s=sym: _scan_one(s)) for sym in symbols}
+    if include_gold:
+        jobs["GOLD"] = _scan_gold
+    if include_currency:
+        for cur_name in CURRENCY_ROWS:
+            jobs[f"CUR::{cur_name}"] = (lambda n=cur_name: _scan_currency(n))
+
+    all_keys = list(jobs.keys())
+    got = _run_pool(jobs, "دور ۱")
+
+    # ─── دور بازیابی: حداکثر ۲ بار ─────────────────────────────────────
+    # قبلاً این حلقه فقط symbols (سهام) رو دوباره امتحان می‌کرد؛ اگه دریافت طلا یا
+    # ارز توی دور اول به‌خاطر یه خطای شبکه‌ی موقت شکست می‌خورد، هیچ‌وقت دوباره
+    # امتحان نمی‌شد و کلاً از خروجی حذف می‌شد — بدون هیچ خطایی. حالا همه‌ی
+    # job ها (سهام + طلا + ارز) یکسان بازیابی می‌شن.
+    for round_no in range(2, 4):
+        failed = [k for k in all_keys if k not in got]
+        if not failed:
+            break
+        log.info("بازیابی %d: %d مورد ناموفق...", round_no - 1, len(failed))
+        time.sleep(5)
+        retry_jobs: dict = {
+            k: (lambda fn=jobs[k]: (time.sleep(random.uniform(1, 5)), fn())[1])
+            for k in failed
+        }
+        before = len(got)
+        got.update(_run_pool(retry_jobs, f"بازیابی {round_no - 1}"))
+        gained = len(got) - before
+        if gained == 0:
+            log.info("بازیابی %d: بدون پیشرفت — متوقف", round_no - 1)
+            break
+        log.info("بازیابی %d: +%d مورد نجات یافت", round_no - 1, gained)
+
+    # مواردی که واقعا داده ندارند — قبلاً این بخش هم فقط symbols رو پوشش می‌داد،
+    # یعنی اگه طلا/ارز نهایتاً شکست می‌خورد، به‌جای یه ردیف خطا، کلاً از خروجی
+    # (حتی از CSV و داشبورد) ناپدید می‌شد. حالا برای همه‌ی job های ناموفق یه
+    # ردیف خطای صریح ثبت می‌شه.
+    for k in [k for k in all_keys if k not in got]:
+        if k == "GOLD":
+            got[k] = Result(symbol="طلای 18 عیار", asset_type="طلا", error="داده دریافت نشد")
+        elif k.startswith("CUR::"):
+            cur_name = k[len("CUR::"):]
+            got[k] = Result(symbol=cur_name, asset_type=cur_name, error="داده دریافت نشد")
+        else:
+            got[k] = Result(symbol=k, error="داده دریافت نشد")
+
+    results: list[Result] = list(got.values())
 
     # ساخت DataFrame نهایی
     rows = []
@@ -483,6 +599,17 @@ def save_csv(df: pd.DataFrame, path: Path):
     log.info("CSV ذخیره شد: %s", path)
 
 
+def _fmt(v, spec=".1f", suffix=""):
+    """فرمت امن برای مقادیر عددی که ممکنه NaN باشن (مثلاً ردیف‌های خطا) —
+    قبلاً این‌ها به‌صورت متن 'nan' توی جدول HTML نمایش داده می‌شدن."""
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        return f"{float(v):{spec}}{suffix}"
+    except Exception:
+        return "—"
+
+
 def save_html_dashboard(df: pd.DataFrame, path: Path):
     """داشبورد HTML تعاملی با جدول قابل فیلتر و مرتب‌سازی."""
     signal_colors = {"BUY": "#16a34a", "NEUTRAL": "#ca8a04", "SELL": "#dc2626"}
@@ -493,23 +620,23 @@ def save_html_dashboard(df: pd.DataFrame, path: Path):
         sig = r["سیگنال"]
         color = signal_colors.get(sig, "#64748b")
         label = signal_labels.get(sig, sig)
-        score = r["امتیاز"]
+        score = r["امتیاز"] if not pd.isna(r["امتیاز"]) else 0.0
         bar = f'<div style="width:{min(score,100)}%;height:6px;background:{color};border-radius:3px;display:inline-block;"></div>'
         rows_html += f"""
         <tr data-signal="{sig}" data-type="{r.get('نوع', 'سهم')}">
           <td>{int(r['رتبه'])}</td>
           <td class="sym">{r['نماد']}</td>
           <td class="type">{r.get('نوع', 'سهم')}</td>
-          <td class="score">{score:.1f} {bar}</td>
+          <td class="score">{_fmt(score)} {bar}</td>
           <td style="color:{color};font-weight:600">{label}</td>
-          <td>{r['RSI']:.1f}</td>
-          <td>{r['MACD_diff']:.2f}</td>
-          <td>{r['EMA_pct']:.1f}%</td>
-          <td>{r['BB_pct']:.1f}%</td>
-          <td>{r['Stoch_RSI']:.1f}</td>
-          <td>{r['ADX']:.1f}</td>
-          <td>{r.get('SMA', 0):.0f}</td>
-          <td>{r['حجم_نسبی']:.1f}x</td>
+          <td>{_fmt(r['RSI'])}</td>
+          <td>{_fmt(r['MACD_diff'], '.2f')}</td>
+          <td>{_fmt(r['EMA_pct'], '.1f', '%')}</td>
+          <td>{_fmt(r['BB_pct'], '.1f', '%')}</td>
+          <td>{_fmt(r['Stoch_RSI'])}</td>
+          <td>{_fmt(r['ADX'])}</td>
+          <td>{_fmt(r.get('SMA', float('nan')), '.0f')}</td>
+          <td>{_fmt(r['حجم_نسبی'], '.1f', 'x')}</td>
           <td>{r['تعداد_روز']}</td>
         </tr>"""
 
@@ -697,23 +824,26 @@ def main():
                         default="all", help="فیلتر دارایی‌ها (all=همه)")
     args = parser.parse_args()
 
-    # دریافت لیست نمادها
-    symbols = fetch_all_symbols()
-    if not symbols:
-        log.error("هیچ نمادی دریافت نشد! اتصال به rahavard365.com را بررسی کنید.")
-        return
+    # قبلاً fetch_all_symbols() همیشه صدا زده می‌شد — حتی وقتی کاربر فقط
+    # --assets gold یا --assets currency خواسته بود — و اگه اون درخواست (که
+    # اصلاً لازم نبود) شکست می‌خورد، کل اجرا با یه خطا متوقف می‌شد. حالا فقط
+    # وقتی سهام واقعاً لازمه این فراخوانی انجام می‌شه.
+    include_stocks   = args.assets in ("all", "stocks")
+    include_gold     = args.assets in ("all", "gold")
+    include_currency = args.assets in ("all", "currency")
 
-    include_assets = args.assets in ("all", "gold", "currency")
-    if args.assets == "stocks":
-        include_assets = False
-    elif args.assets == "gold":
-        symbols = []  # فقط طلا
-    elif args.assets == "currency":
-        symbols = []  # فقط ارزها
+    symbols: list[str] = []
+    if include_stocks:
+        symbols = fetch_all_symbols()
+        if not symbols:
+            log.error("هیچ نمادی دریافت نشد! اتصال به tsetmc.com را بررسی کنید.")
+            if not (include_gold or include_currency):
+                return
+            log.warning("ادامه اسکن فقط با طلا/ارز...")
 
     # اسکن
     df = scan_market(symbols, max_symbols=args.max, use_cache=not args.no_cache,
-                     include_assets=include_assets)
+                     include_gold=include_gold, include_currency=include_currency)
 
     # ذخیره خروجی کامل
     ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M")
